@@ -1,0 +1,36 @@
+name: Publish approved Zorvi Fire TV v1.7.4 into original v1.7.0 release
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/zorvi-tv-v174-release-upload.yml']
+permissions:
+  contents: write
+jobs:
+  update-existing-release-asset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APK_SOURCE_URL: "https://sdmntprcentralus.oaiusercontent.com/files/00000000-064c-81f5-9ead-6dcf52bd2bb6/raw?se=2026-11-22T23%3A07%3A03Z&sp=r&sv=2026-06-06&sr=b&scid=5e4bcc46-e264-54af-82e2-9e59a42da9ef&skoid=80e81ea6-3c08-46f9-bd84-b87176742bcd&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-11-22T13%3A08%3A29Z&ske=2026-11-23T13%3A08%3A29Z&sks=b&skv=2026-06-06&sig=dZ65vgL2nvs06HUZaEhNxj%2B8uwl6bxv2yi3nkP8UkLc%3D"
+      EXPECTED_SHA256: b1995616d35f1617eec60001e413f214aefe3833179a3a501c0a0743edfe10d2
+    steps:
+      - name: Download approved signed APK artifact from private QA build
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 "$APK_SOURCE_URL" --output "$RUNNER_TEMP/artifact.zip"
+          unzip -t "$RUNNER_TEMP/artifact.zip" | tail -1
+          mkdir -p "$RUNNER_TEMP/new"
+          unzip -j "$RUNNER_TEMP/artifact.zip" Zorvi-TV.apk -d "$RUNNER_TEMP/new"
+          test "$(stat -c %s "$RUNNER_TEMP/new/Zorvi-TV.apk")" -eq 91367887
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/new/Zorvi-TV.apk" | sha256sum -c -
+      - name: Upload v1.7.4 to existing release preserving Downloader code 6361974
+        run: |
+          set -euo pipefail
+          gh release upload v1.7.0 "$RUNNER_TEMP/new/Zorvi-TV.apk" --clobber --repo "$GITHUB_REPOSITORY"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v1.7.0" --jq '.assets[] | select(.name == "Zorvi-TV.apk") | [.name,.size,.state] | @tsv'
+      - name: Confirm new public release APK asset size
+        run: |
+          set -euo pipefail
+          size=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v1.7.0" --jq '.assets[] | select(.name == "Zorvi-TV.apk") | .size')
+          test "$size" = 91367887
+          echo "PUBLISHED: Existing Downloader code 6361974 now references verified v1.7.4 APK"
