@@ -1,0 +1,125 @@
+name: Validate Zorvi TV APK compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_url:
+        description: HTTPS link to new APK for required PRE-PUBLISH compatibility test
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'v1.7.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+      - name: Install Android validation tools
+        run: sdkmanager "build-tools;35.0.0"
+
+      - name: Find previous official release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          releases=json.loads((Path(os.environ["RUNNER_TEMP"])/"releases.json").read_text())
+          candidate=os.environ.get("CANDIDATE_TAG", "")
+          usable=[]
+          for release in releases:
+              tag=release.get("tag_name","")
+              match=re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)",tag)
+              if not match or release.get("draft") or release.get("prerelease") or tag==candidate: continue
+              v=tuple(map(int,match.groups()))
+              if v >= (1,7,0): usable.append((v,tag))
+          if not usable: raise SystemExit("No official v1.7.0+ baseline release found")
+          prior=max(usable)[1]
+          print("Previous permanent-signed release:",prior)
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f: f.write("tag="+prior+"\n")
+          PY
+
+      - name: Download official release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          CANDIDATE_TAG: ${{ github.event.release.tag_name }}
+          CANDIDATE_URL: ${{ inputs.candidate_url }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/anchor" "$RUNNER_TEMP/previous" "$RUNNER_TEMP/candidate"
+          gh release download v1.7.0 --repo "$GITHUB_REPOSITORY" --pattern Zorvi-TV.apk --dir "$RUNNER_TEMP/anchor"
+          gh release download "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" --pattern Zorvi-TV.apk --dir "$RUNNER_TEMP/previous"
+          if [[ "$GITHUB_EVENT_NAME" == release ]]; then
+            gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --pattern Zorvi-TV.apk --dir "$RUNNER_TEMP/candidate"
+          else
+            if [[ ! "$CANDIDATE_URL" =~ ^https:// ]]; then
+              echo 'Candidate URL must start with HTTPS' >&2; exit 1
+            fi
+            curl --fail --location --retry 3 --max-time 240 --output "$RUNNER_TEMP/candidate/Zorvi-TV.apk" "$CANDIDATE_URL"
+          fi
+
+      - name: Verify signing, version, OS support and APK integrity
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, re, subprocess, sys, zipfile
+          from pathlib import Path
+          root=Path(os.environ["RUNNER_TEMP"])
+          tools=Path(os.environ["ANDROID_HOME"])/"build-tools"/"35.0.0"
+          pinned="b1995616d35f1617eec60001e413f214aefe3833179a3a501c0a0743edfe10d2"
+          package="com.zorvi.tv.official"
+          def cmd(*args):
+              x=subprocess.run(args,capture_output=True,text=True)
+              if x.returncode:
+                  raise RuntimeError(f"{args[0]} failed: {x.stdout}\n{x.stderr}")
+              return x.stdout
+          def info(name):
+              path=root/name/"Zorvi-TV.apk"
+              if not path.exists() or path.stat().st_size < 100000:
+                  raise RuntimeError(f"APK missing or too small: {path}")
+              with zipfile.ZipFile(path) as z:
+                  bad=z.testzip()
+                  if bad: raise RuntimeError(f"Corrupt member: {bad}")
+                  abi={p.split("/")[1] for p in z.namelist() if p.startswith("lib/") and p.endswith(".so") and len(p.split("/"))>2}
+              manifest=cmd(str(tools/"aapt"),"dump","badging",str(path))
+              sig=cmd(str(tools/"apksigner"),"verify","--verbose","--print-certs",str(path))
+              m=re.search(r"^package: name='([^']+)' versionCode='(\d+)'",manifest,re.M)
+              s=re.search(r"^sdkVersion:'(\d+)'",manifest,re.M)
+              certs=set(x.lower() for x in re.findall(r"Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})",sig))
+              if not m or not s or len(certs)!=1: raise RuntimeError(f"Unparseable APK metadata: {path}")
+              return dict(pkg=m.group(1),version=int(m.group(2)),minSdk=int(s.group(1)),
+                          cert=certs.pop(),abi=abi,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+          try:
+              base,prev,now=[info(n) for n in ["anchor","previous","candidate"]]
+              errors=[]
+              if base["sha256"]!=pinned: errors.append("Trusted v1.7.0 baseline APK changed: verify source")
+              for name,v in [("Baseline",base),("Previous",prev),("Candidate",now)]:
+                  if v["pkg"]!=package: errors.append(f"{name} package ID changed: {v['pkg']}")
+              if prev["cert"]!=base["cert"]: errors.append("Previous release was not signed with the permanent certificate")
+              if now["cert"]!=base["cert"]: errors.append("Certificate mismatch: existing installs would reject this update")
+              if now["version"]<=prev["version"]: errors.append(f"versionCode must increase: {prev['version']} -> {now['version']}")
+              if now["minSdk"]>prev["minSdk"]: errors.append(f"minSdk increased: {prev['minSdk']} -> {now['minSdk']}")
+              if prev["abi"] and now["abi"] and not prev["abi"].issubset(now["abi"]):
+                  errors.append("Native ABI support was removed: "+str(sorted(prev["abi"]-now["abi"])))
+              print("Baseline:",base,"\nPrevious:",prev,"\nCandidate:",now)
+              with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
+                  f.write("## Zorvi APK compatibility result\n\n")
+                  f.write("**"+("FAIL" if errors else "PASS")+"**\n\n")
+                  for err in errors: f.write("- "+err+"\n")
+              if errors:
+                  for err in errors: print("FAIL:",err,file=sys.stderr)
+                  sys.exit(1)
+              print("PASS: signed, incremented version, same package, no Android SDK/ABI regression")
+          except Exception as e:
+              print("VALIDATION FAILED:",e,file=sys.stderr)
+              sys.exit(1)
+          PY
